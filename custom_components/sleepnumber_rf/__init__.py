@@ -7,13 +7,14 @@ import voluptuous as vol
 from homeassistant import config_entries
 from homeassistant.const import Platform
 from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .const import DOMAIN
 from .client import BridgeClient, BridgeError
 
-PLATFORMS = [Platform.COVER, Platform.LIGHT, Platform.BUTTON, Platform.SENSOR]
+PLATFORMS = [Platform.NUMBER, Platform.COVER, Platform.LIGHT, Platform.BUTTON, Platform.SENSOR]
 CONFIG_SCHEMA = vol.Schema({vol.Optional(DOMAIN): vol.Schema({vol.Required("host"): cv.string})}, extra=vol.ALLOW_EXTRA)
 
 
@@ -39,6 +40,21 @@ async def async_setup_entry(hass, entry):
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = {"coordinator": coordinator, "client": client}
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     entry.async_on_unload(entry.add_update_listener(_reload))
+    return True
+
+
+async def async_migrate_entry(hass, entry):
+    """Use the slider in automatic dashboards, preserving the cover for automations."""
+    if entry.version > 1:
+        return False
+    if entry.minor_version < 2:
+        registry = er.async_get(hass)
+        for entity in er.async_entries_for_config_entry(registry, entry.entry_id):
+            if (entity.domain == "cover" and entity.platform == DOMAIN
+                    and entity.unique_id == entry.unique_id + "_head"
+                    and entity.hidden_by is None):
+                registry.async_update_entity(entity.entity_id, hidden_by=er.RegistryEntryHider.INTEGRATION)
+        hass.config_entries.async_update_entry(entry, minor_version=2, version=1)
     return True
 
 

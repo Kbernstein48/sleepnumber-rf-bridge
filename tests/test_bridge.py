@@ -11,6 +11,7 @@ from aiohttp import ClientSession
 from aiohttp.test_utils import TestClient, TestServer
 
 from sleepnumber_rf.config import validate, save, load
+from sleepnumber_rf import __version__
 from sleepnumber_rf.controller import Controller, MotionCancelled
 from sleepnumber_rf.protocol import crc154, decode, encode, Frame, matches, head_payload, foundation_status
 from sleepnumber_rf.server import make_app, SERVICE, Service
@@ -199,7 +200,7 @@ class APITests(unittest.IsolatedAsyncioTestCase):
         spec.loader.exec_module(module)
         async with ClientSession() as session:
             client = module.BridgeClient(session, str(self.client.make_url("/")).rstrip("/"))
-            self.assertEqual((await client.status())["version"], "0.1.0")
+            self.assertEqual((await client.status())["version"], __version__)
             job = await client.command("refresh")
             self.assertEqual(job["state"], "succeeded")
             self.assertFalse(any(c[0] == 0x11 for c in self.controller.transport.calls))

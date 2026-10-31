@@ -2,17 +2,19 @@
 
 from hashlib import sha256
 from pathlib import Path
+import json
 import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
 DIST = ROOT / "dist"
 EXCLUDED = {".git", ".venv", "__pycache__", "dist", "build", "data", ".pytest_cache"}
+VERSION = json.loads((ROOT / "custom_components/sleepnumber_rf/manifest.json").read_text())["version"]
 
 
 def build():
     DIST.mkdir(exist_ok=True)
     outputs = []
-    for name, source_only in (("sleepnumber-rf-bridge-0.1.0.zip", False), ("sleepnumber-rf-home-assistant-0.1.0.zip", True)):
+    for name, source_only in ((f"sleepnumber-rf-bridge-{VERSION}.zip", False), (f"sleepnumber-rf-home-assistant-{VERSION}.zip", True)):
         path = DIST / name
         with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as archive:
             for item in sorted(ROOT.rglob("*")):
@@ -27,7 +29,8 @@ def build():
                 info.compress_type = zipfile.ZIP_DEFLATED
                 archive.writestr(info, item.read_bytes())
         outputs.append(path)
-    (DIST / "SHA256SUMS").write_text("".join(f"{sha256(path.read_bytes()).hexdigest()}  {path.name}\n" for path in outputs), encoding="utf-8")
+    assets = outputs + sorted(DIST.glob(f"sleepnumber_rf_bridge-{VERSION}-*.whl"))
+    (DIST / "SHA256SUMS").write_text("".join(f"{sha256(path.read_bytes()).hexdigest()}  {path.name}\n" for path in assets), encoding="utf-8")
     for path in outputs:
         print(path)
 

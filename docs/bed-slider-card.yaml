@@ -1,0 +1,8 @@
+# Adjust the entity ID if you renamed the device or entity.
+type: tile
+entity: number.sleep_number_base_head_position
+name: Bed head
+icon: mdi:bed
+features:
+  - type: numeric-input
+    style: slider

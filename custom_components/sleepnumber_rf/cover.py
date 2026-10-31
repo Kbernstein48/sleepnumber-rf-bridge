@@ -11,6 +11,9 @@ async def async_setup_entry(hass, entry, async_add_entities):
 
 
 class HeadCover(BedEntity, CoverEntity):
+    # Keep the established entity ID available for automations and manual cards.
+    # Automatic dashboards use the native percentage slider instead of arrows.
+    _attr_entity_registry_visible_default = False
     _attr_icon = "mdi:bed"
     _attr_supported_features = (CoverEntityFeature.OPEN | CoverEntityFeature.CLOSE | CoverEntityFeature.STOP | CoverEntityFeature.SET_POSITION)
 

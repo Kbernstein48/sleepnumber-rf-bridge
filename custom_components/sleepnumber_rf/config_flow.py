@@ -10,6 +10,7 @@ from .const import DOMAIN
 
 class SleepNumberRFFlow(config_entries.ConfigFlow, domain=DOMAIN):
     VERSION = 1
+    MINOR_VERSION = 2
 
     async def validate(self, data):
         data = {"host": normalize_host(data["host"])}
