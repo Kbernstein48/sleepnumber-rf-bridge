@@ -79,6 +79,16 @@ class Transport:
         if int(status):
             raise RadioError(f"{operation}: {status}")
 
+    async def set_channel(self, channel):
+        """Retune without changing the persisted configuration."""
+        if type(channel) is not int or not 11 <= channel <= 26:
+            raise ValueError("Invalid RF channel")
+        if not self.ready:
+            raise RadioError("Radio disconnected")
+        async with self.request_lock:
+            (status,) = await asyncio.wait_for(self.radio.mfglibSetChannel(channel=channel), 3)
+            self.check(status, "Set channel")
+
     async def close(self):
         self.ready = False
         try:

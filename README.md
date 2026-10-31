@@ -12,7 +12,7 @@ The bridge runs independently of Home Assistant. The Home Assistant component ta
 | Controls | One head axis, actual position feedback, underbed outlet on/off |
 | Radio | HUSBZB-1 Zigbee interface, EmberZNet 5.4.1.0 build 962, EZSP v4 |
 | Serial | 57600 baud, hardware flow control |
-| RF | Channel 15, proprietary SMAC/MCR over IEEE 802.15.4 |
+| RF | Channels 15 and 20 observed; proprietary SMAC/MCR over IEEE 802.15.4 |
 | Host | Linux ARM64 Raspberry Pi; Python 3.14, bellows 0.49.2 |
 | Home Assistant | Container 2026.6.3; custom integration installed separately |
 
@@ -30,7 +30,7 @@ The Zigbee interface is dedicated to this service while it runs. It cannot simul
    cp config.example.json data/config.json
    ```
 
-3. Edit `data/config.json`. Replace `abcd` with the final four hexadecimal digits of the foundation's radio address on its exterior controller label. The full radio address is distinct from the serial number. Check it against a passive survey if uncertain. Set `channel`, serial device and underbed outlets for the installation. The sample controls outlet 3; outlet 4 can be added after verification.
+3. Edit `data/config.json`. Replace `abcd` with the final four hexadecimal digits of the foundation's radio address on its exterior controller label. The full radio address is distinct from the serial number. Check it against a passive survey if uncertain. Set the initial `channel`, serial device and underbed outlets for the installation. The sample controls outlet 3; outlet 4 can be added after verification.
 4. Start:
 
    ```sh
@@ -40,6 +40,8 @@ The Zigbee interface is dedicated to this service while it runs. It cannot simul
 5. Open `http://YOUR-PI:8768`. The bridge reads the actual position and light state. Startup and reconnect never restore motion or light commands.
 
 The `data` directory persists settings and positional presets across power loss and application upgrades. The visual head-angle calibration and theme are stored in each browser. Favorite can be saved from the web app at the current reported head position. These are bridge positional presets; the base's original stored native presets are untouched.
+
+The RF channel is not assumed to stay fixed. After three failed polls and stale position telemetry, the bridge searches channels 11–26 using plain status queries addressed to the configured base. Two replies verify the working channel, which is saved automatically. Searches run under the same lock as physical jobs, never interrupt active movement, and never repeat a failed movement or light command. If no channel answers, the previous channel is restored and another search waits at least 60 seconds.
 
 For a stable host device path, set `RADIO_DEVICE=/dev/serial/by-id/YOUR-ADAPTER-if01-port0` in a local `.env` file. It maps to `/dev/ttyUSB1` inside the container. Check the adapter's interfaces before selecting a path: the verified HUSBZB-1 used `if01` for Zigbee and `if00` for Z-Wave.
 
@@ -63,6 +65,8 @@ python -m sleepnumber_rf.discover --device /dev/ttyUSB1 --channel 15 --seconds 3
 ```
 
 Add `--all-channels --seconds 3` to sample channels 11–26. This lists valid-FCS SMAC candidates, addresses, RSSI and command counts. Match the address to the controller label; a nearby radio alone is not proof of identity. The survey sends no RF requests and restores test mode/channel afterward.
+
+An empty passive survey does not prove that the base is offline. A base that is quiet during the sampling window can still reply to a directed status query. The running bridge's automatic channel recovery uses directed status reads for this reason.
 
 ## Home Assistant
 
@@ -89,6 +93,12 @@ sleepnumber_rf:
 
 Once imported, the entry persists in Home Assistant and that YAML section can be removed. Keep a backup of the Home Assistant config directory when migrating to preserve areas, dashboards and automations. The repository includes the customary custom-component/HACS layout and metadata; publication is independent of listing in any integration store.
 
+### Apple Home / HomeKit
+
+Home Assistant's HomeKit Bridge can expose the existing cover entity as a percentage-adjustable window-covering accessory named **Bed**, alongside the underbed light. Explicitly include the cover entity in the HomeKit filter because it is hidden from automatic Home Assistant dashboards. The native HA number slider remains available separately. Pairing with Apple Home is completed using Home Assistant's HomeKit Pairing notification. Apple Home may retain an accessory name after pairing; its accessory settings let you rename the displayed label.
+
+If Apple Home reports No Response, check `/api/v1/status` and the corresponding HA entities first. A paired HomeKit bridge can be reachable while the bed's RF channel is wrong. Version 0.1.2 adds automatic channel recovery; existing 0.1.x Home Assistant components remain compatible.
+
 ## API
 
 The web app and integration use the same unauthenticated local API. It is intended for a trusted LAN. See [the API reference](docs/API.md) for jobs, errors and examples.
@@ -111,7 +121,7 @@ python -m unittest discover -s tests -v
 python scripts/package.py
 ```
 
-The package script creates clean source and Home Assistant ZIPs with SHA-256 checksums. Tests cover framing/corruption, routing, head-only payloads, persistence, missed replies, Stop preemption, job cancellation, startup behavior, API validation and the actual Home Assistant HTTP client. CI runs Python tests and Home Assistant's manifest/translation validator. [Protocol notes](docs/PROTOCOL.md) distinguish measured behavior from remaining work.
+The package script creates clean source and Home Assistant ZIPs with SHA-256 checksums. Tests cover framing/corruption, routing, head-only payloads, persistence, missed replies, channel recovery and backoff, Stop preemption, job cancellation, startup behavior, API validation and the actual Home Assistant HTTP client. CI runs Python tests and Home Assistant's manifest/translation validator. [Protocol notes](docs/PROTOCOL.md) distinguish measured behavior from remaining work.
 
 ## Credits and license
 

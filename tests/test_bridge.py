@@ -78,6 +78,8 @@ class FakeTransport:
         self.ready = True
         self.rssi = -45
         self.calls = []
+        self.channel = configuration["channel"]
+        self.channels = []
         self.keep = []
         self.plain = []
         self.current = status(40)
@@ -87,6 +89,10 @@ class FakeTransport:
 
     async def close(self):
         self.ready = False
+
+    async def set_channel(self, channel):
+        self.channel = channel
+        self.channels.append(channel)
 
     async def request(self, command, qualifier=0, payload=b"", **kwargs):
         self.calls.append((command, qualifier, payload))
@@ -155,6 +161,73 @@ class ControllerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(service.pending[0]["job_id"], stop["job_id"])
         self.assertTrue(controller.stop_event.is_set())
         self.assertFalse(controller.transport.calls)
+
+
+class ChannelRecoveryTests(unittest.IsolatedAsyncioTestCase):
+    class ChangedChannel(FakeTransport):
+        async def request(self, command, qualifier=0, payload=b"", **kwargs):
+            if self.channel != 20:
+                self.calls.append((command, qualifier, payload))
+                raise ReadTimeout("No reply on old channel")
+            return await super().request(command, qualifier, payload, **kwargs)
+
+    class Offline(FakeTransport):
+        async def request(self, command, qualifier=0, payload=b"", **kwargs):
+            self.calls.append((command, qualifier, payload))
+            raise ReadTimeout("No base")
+
+    async def test_three_failed_polls_find_and_persist_new_channel(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.json"
+            controller = Controller(config(), self.ChangedChannel)
+            service = Service(controller.config, path, controller)
+            await controller.poll_once()
+            await controller.poll_once()
+            self.assertFalse(controller.transport.channels)
+            await controller.poll_once()
+            self.assertEqual(controller.config["channel"], 20)
+            self.assertEqual(load(path)["channel"], 20)
+            self.assertTrue(service.status()["bed"]["connected"])
+            self.assertEqual(controller.poll_failures, 0)
+            # Recovery must not replay a motor, native preset or light command.
+            self.assertTrue(all(call[0] == 0x12 and call[1] == 0 for call in controller.transport.calls))
+            self.assertFalse(service.jobs)
+
+    async def test_offline_scan_restores_channel_and_backs_off(self):
+        controller = Controller(config(), self.Offline)
+        for _ in range(3):
+            await controller.poll_once()
+        self.assertEqual(controller.config["channel"], 15)
+        self.assertEqual(controller.transport.channel, 15)
+        self.assertEqual(set(controller.transport.channels), set(range(11, 27)))
+        count = len(controller.transport.channels)
+        for _ in range(4):
+            await controller.poll_once()
+        self.assertEqual(len(controller.transport.channels), count)
+        self.assertFalse(controller.snapshot()["connected"])
+
+    async def test_recovery_waits_for_active_operation_lock(self):
+        controller = Controller(config(), self.ChangedChannel)
+        controller.poll_failures = 3
+        async with controller.operation_lock:
+            task = asyncio.create_task(controller.poll_once())
+            await asyncio.sleep(0.02)
+            self.assertFalse(task.done())
+            self.assertFalse(controller.transport.calls)
+        await task
+        self.assertEqual(controller.config["channel"], 20)
+
+    async def test_light_read_failures_do_not_trigger_channel_hunt(self):
+        class LightTimeout(FakeTransport):
+            async def request(self, command, qualifier=0, payload=b"", **kwargs):
+                if command == 0x14:
+                    raise ReadTimeout("Light read missing")
+                return await super().request(command, qualifier, payload, **kwargs)
+        controller = Controller(config(), LightTimeout)
+        for _ in range(4):
+            await controller.poll_once()
+        self.assertFalse(controller.transport.channels)
+        self.assertTrue(controller.snapshot()["connected"])
 
 
 class RadioTests(unittest.IsolatedAsyncioTestCase):

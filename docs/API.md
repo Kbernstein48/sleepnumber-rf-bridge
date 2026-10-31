@@ -23,6 +23,8 @@ HTTP 400 rejects malformed JSON, unsupported actions/axes or invalid values. HTT
 
 `positions.right_head` reports measured 0–100%. `connected` requires a live serial session and status less than 15 seconds old. Cached position can remain present when disconnected; use `connected`/`age_ms` to assess availability. `moving`, `homing`, `fault`, `busy`, and `error` describe the current controller state. `radio.rssi` is in dBm. Light `on` is read back from configured outlets; unknown state is `null`.
 
+`discovering` indicates automatic RF-channel recovery. During a search, `busy` is true. After repeated status timeouts, the controller probes channels 11–26 with plain addressed status reads, verifies two replies and saves the working channel. No prior physical job is replayed. The search is serialized with physical operations, so it never retunes during an active movement job. A failed search restores the configured channel and waits at least 60 seconds before another search.
+
 Light-on uses a 120-minute base timer. Light-off clears the timer. Brightness changes are not exposed in this release because the intensity command has not been physically verified. The driver does not restore light state after restart.
 
 Save positional presets without moving:

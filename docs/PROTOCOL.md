@@ -2,7 +2,7 @@
 
 ## Framing
 
-The verified LPM-9000B talks proprietary SMAC over the IEEE 802.15.4 PHY, using channel 15. An HUSBZB-1 with EZSP v4 / EmberZNet 5.4.1 can receive and transmit these frames through `mfglibStart(rxCallback=True)`, `mfglibRxHandler` and `mfglibSendPacket`. It is not joined to a network. No adapter firmware was flashed.
+The verified LPM-9000B talks proprietary SMAC over the IEEE 802.15.4 PHY. It was initially found on channel 15, then later answered on channel 20 while the bridge was still configured for 15. The channel therefore cannot be assumed fixed. An HUSBZB-1 with EZSP v4 / EmberZNet 5.4.1 can receive and transmit these frames through `mfglibStart(rxCallback=True)`, `mfglibRxHandler` and `mfglibSendPacket`. It is not joined to a network. No adapter firmware was flashed.
 
 Packet: `7e ff` + ten-byte MCR-shaped header + 0–15 payload bytes + IEEE 802.15.4 FCS (CRC-16/KERMIT, reflected polynomial 0x8408, initial zero, little endian).
 
@@ -17,6 +17,8 @@ Packet: `7e ff` + ten-byte MCR-shaped header + 0–15 payload bytes + IEEE 802.1
 | 9 | Qualifier in high nibble; payload length in low nibble |
 
 The last four hex digits of the controller label's radio address matched the received RF source. Changing the request source to zero was the key breakthrough: requests using the USB adapter's identity received no replies. No bind or pairing-button procedure was needed with the verified foundation.
+
+A later outage produced no base frames in short passive samples across the radio channels, even though the USB receiver heard other Zigbee traffic. Directed function-0x12 reads found the same base on channel 20 and returned valid position/fault telemetry. The time and cause of the channel change were not established. Recovery now probes addressed status on channels 11–26, requires two valid replies, and persists the resulting channel. It sends no motion, outlet, native preset or pairing writes. Recovery holds the physical-operation lock, restores the prior channel if unsuccessful, and backs off for 60 seconds between failed searches.
 
 Bellows serializes the LVBytes length itself. Give `mfglibSendPacket` the complete SMAC/header/payload/FCS bytes; do not prepend an additional length byte. The old NCP regenerates the final two FCS bytes. Its receive callback retains a valid FCS. Newer NCP versions may differ and have not been validated.
 

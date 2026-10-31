@@ -24,6 +24,7 @@ class Service:
     def __init__(self, config, config_path=None, controller=None):
         self.config, self.config_path = config, config_path
         self.controller = controller or Controller(config)
+        self.controller.config_changed = self.persist
         self.jobs = {}
         self.pending = deque()
         self.wake = asyncio.Event()

@@ -29,6 +29,10 @@ class Controller:
         self.operation_lock = asyncio.Lock()
         self.worker = None
         self.closing = False
+        self.discovering = False
+        self.poll_failures = 0
+        self.last_discovery = None
+        self.config_changed = None
 
     async def read_state(self, keep=False):
         data = await self.transport.request(0x12, 2 if keep else 0)
@@ -50,7 +54,8 @@ class Controller:
         connected = bool(self.config["enabled"] and self.transport.ready and age is not None and age < 15000)
         state = self.state or {}
         return {"connected": connected, "transport": "rf", "foundation": bool(self.state),
-                "model": "360 FlexFit", "head_only": True, "busy": self.busy,
+                "model": "360 FlexFit", "head_only": True, "busy": self.busy or self.discovering,
+                "discovering": self.discovering,
                 "moving": state.get("moving", False), "homing": state.get("homing", False),
                 "fault": state.get("fault", False), "age_ms": age, "error": self.error,
                 "positions": {"right_head": state["head"]} if self.state else {},
@@ -60,24 +65,81 @@ class Controller:
                 "radio": {"channel": self.config["channel"], "rssi": self.transport.rssi},
                 "stop_method": "withdraw_keepalive"}
 
-    async def maintain(self):
-        while not self.closing:
+    async def discover_channel(self):
+        """Locate the configured address using plain, read-only status requests.
+
+        The operation lock is held by the caller. Never scan during motion or
+        replay a failed movement/light command after a channel is rediscovered.
+        """
+        original = self.config["channel"]
+        found = False
+        self.discovering = True
+        self.error = "Searching RF channels for the base"
+        self.last_discovery = time.monotonic()
+        try:
+            channels = [original] + [channel for channel in range(11, 27) if channel != original]
+            for channel in channels:
+                if self.closing or not self.config["enabled"]:
+                    return False
+                await self.transport.set_channel(channel)
+                try:
+                    # Two addressed replies reduce the risk of adopting a
+                    # channel based on a single delayed/corrupted transaction.
+                    foundation_status(await self.transport.request(0x12, timeout=0.9))
+                    state = foundation_status(await self.transport.request(0x12, timeout=0.9))
+                except (ReadTimeout, ValueError):
+                    continue
+                self.state = state
+                self.updated = time.monotonic()
+                self.config["channel"] = channel
+                found = True
+                self.poll_failures = 0
+                if channel != original and self.config_changed:
+                    self.config_changed()
+                self.error = ""
+                LOG.info("Base status verified on RF channel %s", channel)
+                return True
+            self.error = "Base did not reply on channels 11–26; waiting before another search"
+            return False
+        finally:
+            self.discovering = False
+            self.last_discovery = time.monotonic()
+            if not found:
+                await self.transport.set_channel(original)
+
+    async def poll_once(self):
+        # Connection changes, ordinary reads, recovery scans and physical jobs
+        # all share this lock. A scan therefore cannot interrupt MicroAdjust.
+        async with self.operation_lock:
             try:
-                async with self.operation_lock:
-                    if self.config["enabled"]:
-                        if not self.transport.ready:
-                            await self.transport.open()
+                if self.config["enabled"]:
+                    if not self.transport.ready:
+                        await self.transport.open()
+                    try:
                         await self.refresh()
-                    elif self.transport.ready:
-                        await self.transport.close()
+                        self.poll_failures = 0
+                    except ReadTimeout as exc:
+                        self.error = str(exc)
+                        self.poll_failures += 1
+                        now = time.monotonic()
+                        stale = not self.updated or now - self.updated >= 8
+                        can_scan = self.last_discovery is None or now - self.last_discovery >= 60
+                        if self.poll_failures >= 3 and stale and can_scan:
+                            await self.discover_channel()
+                        else:
+                            LOG.warning("Radio poll: %s", exc)
+                elif self.transport.ready:
+                    await self.transport.close()
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
                 self.error = str(exc)
                 LOG.warning("Radio poll: %s", exc)
-                # One lost packet should not reset a working radio connection.
-                if not isinstance(exc, ReadTimeout):
-                    await self.transport.close()
+                await self.transport.close()
+
+    async def maintain(self):
+        while not self.closing:
+            await self.poll_once()
             await asyncio.sleep(2)
 
     def start(self):
