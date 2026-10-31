@@ -1,0 +1,12 @@
+services:
+  sleepnumber-rf:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "8768:8768"
+    devices:
+      # Prefer a stable /dev/serial/by-id/... host path here.
+      - "${RADIO_DEVICE:-/dev/ttyUSB1}:/dev/ttyUSB1"
+    volumes:
+      - ./data:/data
+    # Only one process can own this radio. Stop ZHA/Zigbee2MQTT on this device.

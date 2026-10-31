@@ -1,0 +1,10 @@
+.git
+.venv
+data
+dist
+build
+**/__pycache__
+tests
+custom_components
+docs
+*.jsonl

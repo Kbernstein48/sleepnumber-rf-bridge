@@ -1,0 +1,11 @@
+{
+  "title": "Sleep Number RF",
+  "config": {
+    "step": {
+      "user": {"title": "Connect your RF bridge", "description": "Start the standalone RF bridge, then enter its local URL including port (usually 8768).", "data": {"host": "Bridge URL"}},
+      "reconfigure": {"title": "Update bridge address", "data": {"host": "Bridge URL"}}
+    },
+    "error": {"cannot_connect": "Cannot connect to the RF bridge.", "wrong_device": "This address belongs to a different base."},
+    "abort": {"already_configured": "This base is already configured.", "cannot_connect": "Cannot connect to the RF bridge.", "reconfigure_successful": "Bridge address updated."}
+  }
+}

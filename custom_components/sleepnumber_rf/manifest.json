@@ -1,0 +1,12 @@
+{
+  "domain": "sleepnumber_rf",
+  "name": "Sleep Number RF",
+  "codeowners": ["@Kbernstein48"],
+  "config_flow": true,
+  "documentation": "https://github.com/Kbernstein48/sleepnumber-rf-bridge",
+  "integration_type": "device",
+  "iot_class": "local_polling",
+  "issue_tracker": "https://github.com/Kbernstein48/sleepnumber-rf-bridge/issues",
+  "requirements": [],
+  "version": "0.1.0"
+}

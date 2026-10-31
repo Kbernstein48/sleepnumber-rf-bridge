@@ -1,0 +1,10 @@
+{
+  "name": "Sleep Number base",
+  "target": "abcd",
+  "device": "/dev/ttyUSB1",
+  "channel": 15,
+  "enabled": true,
+  "light_outlets": [3],
+  "presets": {"flat": 0},
+  "lock_file": "/tmp/nightstand-husbzb-capture.lock"
+}
