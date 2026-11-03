@@ -9,6 +9,7 @@ from .protocol import foundation_status, head_payload, system_status, outlet_sta
 from .transport import Transport, RadioError, ReadTimeout
 
 LOG = logging.getLogger(__name__)
+POLL_TIMEOUT = 120
 
 
 class MotionCancelled(RadioError):
@@ -33,6 +34,10 @@ class Controller:
         self.poll_failures = 0
         self.last_discovery = None
         self.config_changed = None
+        self.recovery_failures = 0
+        self.radio_restarts = 0
+        self.recoveries = 0
+        self.last_poll = time.monotonic()
 
     async def read_state(self, keep=False):
         data = await self.transport.request(0x12, 2 if keep else 0)
@@ -62,7 +67,9 @@ class Controller:
                 "presets": list(self.config["presets"]),
                 "light": {"available": self.features.get("has_light", False),
                           "on": any(item["on"] for item in self.lights.values()) if self.lights else None},
-                "radio": {"channel": self.config["channel"], "rssi": self.transport.rssi},
+                "radio": {"channel": self.config["channel"], "rssi": self.transport.rssi,
+                          "restarts": self.radio_restarts, "recoveries": self.recoveries,
+                          "failed_searches": self.recovery_failures},
                 "stop_method": "withdraw_keepalive"}
 
     async def discover_channel(self):
@@ -107,6 +114,32 @@ class Controller:
             if not found:
                 await self.transport.set_channel(original)
 
+    async def recover_connection(self):
+        """Recover reads only, including a fresh radio session if scanning fails.
+
+        Called with operation_lock held. Never replay an actuator/light write.
+        A base that has lost power must not cause an unbounded reset loop.
+        """
+        if await self.discover_channel():
+            self.recovery_failures = 0
+            self.recoveries += 1
+            return True
+        if self.closing or not self.config["enabled"]:
+            return False
+        self.error = "Reinitializing radio after unanswered channel search"
+        LOG.warning(self.error)
+        self.radio_restarts += 1
+        await self.transport.close()
+        await self.transport.open()
+        if await self.discover_channel():
+            self.recovery_failures = 0
+            self.recoveries += 1
+            return True
+        self.recovery_failures += 1
+        self.error = "Base not responding after channel search and radio restart; check base power"
+        LOG.warning(self.error)
+        return False
+
     async def poll_once(self):
         # Connection changes, ordinary reads, recovery scans and physical jobs
         # all share this lock. A scan therefore cannot interrupt MicroAdjust.
@@ -118,14 +151,16 @@ class Controller:
                     try:
                         await self.refresh()
                         self.poll_failures = 0
+                        self.recovery_failures = 0
                     except ReadTimeout as exc:
                         self.error = str(exc)
                         self.poll_failures += 1
                         now = time.monotonic()
                         stale = not self.updated or now - self.updated >= 8
-                        can_scan = self.last_discovery is None or now - self.last_discovery >= 60
+                        delay = min(300, 60 * 2 ** min(self.recovery_failures, 3))
+                        can_scan = self.last_discovery is None or now - self.last_discovery >= delay
                         if self.poll_failures >= 3 and stale and can_scan:
-                            await self.discover_channel()
+                            await self.recover_connection()
                         else:
                             LOG.warning("Radio poll: %s", exc)
                 elif self.transport.ready:
@@ -139,7 +174,18 @@ class Controller:
 
     async def maintain(self):
         while not self.closing:
-            await self.poll_once()
+            try:
+                # A responsive HTTP server must not conceal a wedged radio worker.
+                await asyncio.wait_for(self.poll_once(), POLL_TIMEOUT)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self.error = "Radio worker recovered: " + (str(exc) or type(exc).__name__)
+                LOG.exception(self.error)
+                with contextlib.suppress(Exception):
+                    await self.transport.close()
+            finally:
+                self.last_poll = time.monotonic()
             await asyncio.sleep(2)
 
     def start(self):
@@ -253,9 +299,17 @@ class Controller:
             try:
                 if action in ("connect", "reconnect"):
                     self.config["enabled"] = True
+                    if action == "reconnect":
+                        self.radio_restarts += 1
+                        await self.transport.close()
                     if not self.transport.ready:
                         await self.transport.open()
-                    await self.refresh()
+                    try:
+                        await self.refresh()
+                    except ReadTimeout:
+                        if not await self.recover_connection():
+                            raise RadioError(self.error)
+                        await self.refresh()
                 elif action == "disconnect":
                     await self.stop()
                     self.config["enabled"] = False

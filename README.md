@@ -43,6 +43,19 @@ The `data` directory persists settings and positional presets across power loss 
 
 The RF channel is not assumed to stay fixed. After three failed polls and stale position telemetry, the bridge searches channels 11–26 using plain status queries addressed to the configured base. Two replies verify the working channel, which is saved automatically. Searches run under the same lock as physical jobs, never interrupt active movement, and never repeat a failed movement or light command. If no channel answers, the previous channel is restored and another search waits at least 60 seconds.
 
+Version 0.1.3 also reinitializes the radio after an unanswered channel search and
+tries once more. Repeated failed recoveries back off up to five minutes. Every
+channel change is verified against the adapter; radio calls and background polls
+have deadlines. A watchdog exits gracefully if background workers stop
+progressing so Docker can restart the bridge, and a Docker health check exposes
+process health separately from bed availability. Manual Reconnect now genuinely
+reopens the radio. Recovery never replays saved motor or light operations.
+
+These mechanisms recover channel changes and software/radio-session failures.
+They cannot remotely power-cycle a foundation controller that has stopped
+answering entirely. Check the base's power if all channels remain silent; after
+power is restored, the bridge automatically locates its new channel.
+
 For a stable host device path, set `RADIO_DEVICE=/dev/serial/by-id/YOUR-ADAPTER-if01-port0` in a local `.env` file. It maps to `/dev/ttyUSB1` inside the container. Check the adapter's interfaces before selecting a path: the verified HUSBZB-1 used `if01` for Zigbee and `if00` for Z-Wave.
 
 ### Python installation

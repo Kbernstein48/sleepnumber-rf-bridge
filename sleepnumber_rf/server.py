@@ -5,7 +5,9 @@ import asyncio
 from collections import deque
 import contextlib
 import logging
+import os
 from pathlib import Path
+import signal
 import time
 
 from aiohttp import web
@@ -18,6 +20,7 @@ from .protocol import head_payload
 MOTION = {"position", "preset"}
 ACTIONS = MOTION | {"stop", "light", "refresh", "connect", "reconnect", "disconnect"}
 SERVICE = web.AppKey("service", object)
+LOG = logging.getLogger(__name__)
 
 
 class Service:
@@ -31,6 +34,24 @@ class Service:
         self.sequence = int(time.time() * 1000)
         self.active = None
         self.worker = None
+        self.watcher = None
+
+    def healthy(self):
+        c = self.controller
+        return bool(c.worker and not c.worker.done()
+                    and self.worker and not self.worker.done()
+                    and time.monotonic() - c.last_poll < 180)
+
+    async def watchdog(self):
+        while True:
+            await asyncio.sleep(15)
+            if not self.healthy():
+                LOG.critical("Bridge worker stopped progressing; requesting supervised restart")
+                self.controller.stop_event.set()
+                # aiohttp handles SIGTERM gracefully; Docker's restart policy
+                # restarts the process. No saved command queue is replayed.
+                os.kill(os.getpid(), signal.SIGTERM)
+                return
 
     def status(self):
         return {"device_id": "sleepnumber_rf_" + self.config["target"],
@@ -142,6 +163,15 @@ async def bed_status(request):
     return web.json_response(request.app[SERVICE].controller.snapshot())
 
 
+async def health(request):
+    service = request.app[SERVICE]
+    controller = service.controller
+    healthy = service.healthy()
+    return web.json_response({"healthy": healthy,
+                              "bed_connected": controller.snapshot()["connected"]},
+                             status=200 if healthy else 503)
+
+
 async def command(request):
     service = request.app[SERVICE]
     job = service.submit(request.match_info["action"], await body(request))
@@ -178,7 +208,11 @@ async def lifecycle(app):
     service = app[SERVICE]
     service.controller.start()
     service.worker = asyncio.create_task(service.run_jobs())
+    service.watcher = asyncio.create_task(service.watchdog())
     yield
+    service.watcher.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await service.watcher
     service.controller.stop_event.set()
     # Allow active position control to withdraw keepalive and verify idle first.
     if service.active:
@@ -197,6 +231,7 @@ def make_app(config, config_path=None, controller=None):
     app[SERVICE] = Service(config, config_path, controller)
     app.router.add_get("/", index)
     app.router.add_get("/api/v1/status", status)
+    app.router.add_get("/api/v1/health", health)
     app.router.add_get("/api/v1/bed/status", bed_status)
     app.router.add_post("/api/v1/bed/{action}", command)
     app.router.add_get("/api/v1/jobs/{job_id}", job_status)

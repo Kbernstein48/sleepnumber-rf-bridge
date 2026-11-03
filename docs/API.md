@@ -5,6 +5,7 @@ Base URL: `http://YOUR-PI:8768/api/v1`. JSON requests/responses; no authenticati
 | Method | Path | Purpose |
 | --- | --- | --- |
 | GET | `/status` | Bridge ID/version, bed status, positional presets |
+| GET | `/health` | HTTP 200 when background workers progress; 503 if stuck. Includes separate `bed_connected` flag |
 | GET | `/bed/status` | Bed status only |
 | POST | `/bed/position` | `{"value":40}`; integer 0–100, head only |
 | POST | `/bed/preset` | `{"preset":"flat"}` or a saved positional preset |
@@ -12,7 +13,7 @@ Base URL: `http://YOUR-PI:8768/api/v1`. JSON requests/responses; no authenticati
 | POST | `/bed/stop` | `{}`; priority Stop and cancellation of queued moves |
 | POST | `/bed/refresh` | `{}`; refresh hardware readback |
 | POST | `/bed/disconnect` | `{}`; withdraw keepalive, confirm idle, release radio, persist disabled |
-| POST | `/bed/reconnect` | `{}`; enable radio and read actual state, persist enabled |
+| POST | `/bed/reconnect` | `{}`; reopen the radio session, search channels if needed, read actual state and persist enabled |
 | GET | `/jobs/{job_id}` | Job outcome |
 | GET | `/config` | Current configuration |
 | PUT | `/config` | Change `name` and/or `presets` while idle |
@@ -24,6 +25,19 @@ HTTP 400 rejects malformed JSON, unsupported actions/axes or invalid values. HTT
 `positions.right_head` reports measured 0–100%. `connected` requires a live serial session and status less than 15 seconds old. Cached position can remain present when disconnected; use `connected`/`age_ms` to assess availability. `moving`, `homing`, `fault`, `busy`, and `error` describe the current controller state. `radio.rssi` is in dBm. Light `on` is read back from configured outlets; unknown state is `null`.
 
 `discovering` indicates automatic RF-channel recovery. During a search, `busy` is true. After repeated status timeouts, the controller probes channels 11–26 with plain addressed status reads, verifies two replies and saves the working channel. No prior physical job is replayed. The search is serialized with physical operations, so it never retunes during an active movement job. A failed search restores the configured channel and waits at least 60 seconds before another search.
+
+Since 0.1.3, an unanswered full search also closes/reopens the radio and makes one
+more bounded search. Repeated unsuccessful recovery attempts back off up to five
+minutes; ordinary reads continue so a returning base can reconnect sooner.
+`radio.restarts`, `radio.recoveries`, and `radio.failed_searches` expose process-local
+counters. Channel changes are read back from the adapter before probing.
+
+Radio calls and poll cycles have deadlines. A process watchdog requests a graceful
+exit if background workers stop progressing; Docker's `unless-stopped` policy
+restarts it. The Docker health check uses `/health`, which distinguishes a broken
+bridge process from an unplugged/unresponsive base. A base controller that remains
+silent after all searches may require its own power cycle; bridge restarts cannot
+remove power from the base.
 
 Light-on uses a 120-minute base timer. Light-off clears the timer. Brightness changes are not exposed in this release because the intensity command has not been physically verified. The driver does not restore light state after restart.
 

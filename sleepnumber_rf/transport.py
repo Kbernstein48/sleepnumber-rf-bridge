@@ -56,17 +56,17 @@ class Transport:
             self.radio = self.factory({"path": self.config["device"], "baudrate": 57600, "flow_control": "hardware"})
             await asyncio.wait_for(self.radio.connect(), 15)
             await asyncio.wait_for(self.radio.version(), 5)
-            (network,) = await self.radio.networkState()
+            (network,) = await asyncio.wait_for(self.radio.networkState(), 5)
             if int(network):
                 raise RadioError("Radio belongs to a Zigbee network; refusing to take it over")
             self.callback_id = self.radio.add_callback(self.received)
-            (status,) = await self.radio.mfglibStart(rxCallback=True)
+            (status,) = await asyncio.wait_for(self.radio.mfglibStart(rxCallback=True), 5)
             self.check(status, "Start radio")
             self.started = True
-            (self.original_channel,) = await self.radio.mfglibGetChannel()
-            (status,) = await self.radio.mfglibSetChannel(channel=self.config["channel"])
+            (self.original_channel,) = await asyncio.wait_for(self.radio.mfglibGetChannel(), 3)
+            (status,) = await asyncio.wait_for(self.radio.mfglibSetChannel(channel=self.config["channel"]), 3)
             self.check(status, "Set channel")
-            (channel,) = await self.radio.mfglibGetChannel()
+            (channel,) = await asyncio.wait_for(self.radio.mfglibGetChannel(), 3)
             if int(channel) != self.config["channel"]:
                 raise RadioError("Channel verification failed")
             self.ready = True
@@ -88,6 +88,9 @@ class Transport:
         async with self.request_lock:
             (status,) = await asyncio.wait_for(self.radio.mfglibSetChannel(channel=channel), 3)
             self.check(status, "Set channel")
+            (actual,) = await asyncio.wait_for(self.radio.mfglibGetChannel(), 3)
+            if int(actual) != channel:
+                raise RadioError("Channel verification failed")
 
     async def close(self):
         self.ready = False
@@ -102,9 +105,10 @@ class Transport:
                         with contextlib.suppress(Exception):
                             await asyncio.wait_for(self.radio.mfglibEnd(), 2)
                 if self.callback_id is not None:
-                    self.radio.remove_callback(self.callback_id)
+                    with contextlib.suppress(Exception):
+                        self.radio.remove_callback(self.callback_id)
                 with contextlib.suppress(Exception):
-                    await self.radio.disconnect()
+                    await asyncio.wait_for(self.radio.disconnect(), 3)
         finally:
             if self.lock_file is not None:
                 self.lock_file.close()

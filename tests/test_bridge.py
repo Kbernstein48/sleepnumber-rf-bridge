@@ -6,6 +6,7 @@ from pathlib import Path
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 
 from aiohttp import ClientSession
 from aiohttp.test_utils import TestClient, TestServer
@@ -229,8 +230,111 @@ class ChannelRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(controller.transport.channels)
         self.assertTrue(controller.snapshot()["connected"])
 
+    async def test_deaf_radio_and_changed_channel_recover_without_writes(self):
+        class DeafUntilReopened(self.ChangedChannel):
+            reopened = False
+
+            async def open(self):
+                self.reopened = True
+                await super().open()
+
+            async def request(self, command, qualifier=0, payload=b"", **kwargs):
+                if not self.reopened:
+                    self.calls.append((command, qualifier, payload))
+                    raise ReadTimeout("Radio session deaf")
+                return await super().request(command, qualifier, payload, **kwargs)
+
+        controller = Controller(config(), DeafUntilReopened)
+        for _ in range(3):
+            await controller.poll_once()
+        self.assertTrue(controller.snapshot()["connected"])
+        self.assertEqual(controller.config["channel"], 20)
+        self.assertEqual(controller.radio_restarts, 1)
+        self.assertEqual(controller.recoveries, 1)
+        self.assertTrue(all(c[:2] == (0x12, 0) for c in controller.transport.calls))
+
+    async def test_powered_off_base_backs_off_resets_and_recovers_when_back(self):
+        class PowerLoss(self.Offline):
+            online = False
+
+            async def request(self, *args, **kwargs):
+                if self.online:
+                    return await FakeTransport.request(self, *args, **kwargs)
+                return await super().request(*args, **kwargs)
+
+        controller = Controller(config(), PowerLoss)
+        for _ in range(3):
+            await controller.poll_once()
+        self.assertEqual(controller.radio_restarts, 1)
+        self.assertEqual(controller.recovery_failures, 1)
+        first = len(controller.transport.channels)
+        for _ in range(4):
+            await controller.poll_once()
+        self.assertEqual(len(controller.transport.channels), first)
+        self.assertEqual(controller.radio_restarts, 1)
+        self.assertFalse(controller.snapshot()["connected"])
+        controller.transport.online = True
+        await controller.poll_once()
+        self.assertTrue(controller.snapshot()["connected"])
+        self.assertEqual(controller.recovery_failures, 0)
+
+    async def test_manual_reconnect_reopens_healthy_looking_session(self):
+        class Counting(FakeTransport):
+            closed = opened = 0
+
+            async def close(self):
+                self.closed += 1
+                await super().close()
+
+            async def open(self):
+                self.opened += 1
+                await super().open()
+
+        controller = Controller(config(), Counting)
+        await controller.execute("reconnect", {})
+        self.assertEqual((controller.transport.closed, controller.transport.opened), (1, 1))
+        self.assertTrue(controller.snapshot()["connected"])
+        self.assertFalse(any(c[0] in (0x11, 0x13) for c in controller.transport.calls))
+
+    async def test_hung_poll_is_bounded_and_worker_survives(self):
+        controller = Controller(config(), FakeTransport)
+        completed = asyncio.Event()
+        calls = 0
+
+        async def poll():
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                await asyncio.Event().wait()
+            else:
+                completed.set()
+
+        controller.poll_once = poll
+        with patch("sleepnumber_rf.controller.POLL_TIMEOUT", 0.01):
+            controller.start()
+            try:
+                await asyncio.wait_for(completed.wait(), 3)
+                self.assertFalse(controller.worker.done())
+                self.assertFalse(controller.transport.ready)
+            finally:
+                await controller.close()
+
 
 class RadioTests(unittest.IsolatedAsyncioTestCase):
+    async def test_channel_change_is_verified(self):
+        class Radio:
+            async def mfglibSetChannel(self, **kwargs):
+                return (0,)
+
+            async def mfglibGetChannel(self):
+                return (15,)
+
+        transport = Transport(config())
+        transport.radio = Radio()
+        transport.ready = True
+        with self.assertRaisesRegex(RadioError, "verification"):
+            await transport.set_channel(20)
+
     async def test_uncertain_write_not_repeated(self):
         class Radio:
             count = 0
@@ -283,6 +387,25 @@ class APITests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status, 200)
         self.assertEqual((await response.json())["presets"], {"favorite": 37, "flat": 0})
         self.assertFalse(any(c[0] == 0x11 for c in self.controller.transport.calls))
+
+    async def test_health_distinguishes_offline_base_from_stuck_worker(self):
+        await asyncio.sleep(0.01)
+        self.controller.updated = time.monotonic() - 60
+        response = await self.client.get("/api/v1/health")
+        self.assertEqual(response.status, 200)
+        self.assertEqual(await response.json(), {"healthy": True, "bed_connected": False})
+        self.controller.last_poll = time.monotonic() - 181
+        self.assertEqual((await self.client.get("/api/v1/health")).status, 503)
+
+    async def test_watchdog_requests_restart_without_replaying_commands(self):
+        service = self.client.server.app[SERVICE]
+        with patch.object(service, "healthy", return_value=False), \
+                patch("sleepnumber_rf.server.asyncio.sleep", return_value=None), \
+                patch("sleepnumber_rf.server.os.kill") as kill:
+            await service.watchdog()
+        kill.assert_called_once()
+        self.assertTrue(self.controller.stop_event.is_set())
+        self.assertFalse(any(c[0] in (0x11, 0x13) for c in self.controller.transport.calls))
 
 
 if __name__ == "__main__":
