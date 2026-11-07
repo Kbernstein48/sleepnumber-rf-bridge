@@ -41,15 +41,36 @@ The Zigbee interface is dedicated to this service while it runs. It cannot simul
 
 The `data` directory persists settings and positional presets across power loss and application upgrades. The visual head-angle calibration and theme are stored in each browser. Favorite can be saved from the web app at the current reported head position. These are bridge positional presets; the base's original stored native presets are untouched.
 
-The RF channel is not assumed to stay fixed. After three failed polls and stale position telemetry, the bridge searches channels 11–26 using plain status queries addressed to the configured base. Two replies verify the working channel, which is saved automatically. Searches run under the same lock as physical jobs, never interrupt active movement, and never repeat a failed movement or light command. If no channel answers, the previous channel is restored and another search waits at least 60 seconds.
+Version 0.1.4 reduces idle radio traffic. The default is one position read every
+60 seconds, hardware configuration once at startup/explicit reconnect, and one
+light-state read every 300 seconds. A healthy idle hour uses 73 requests including
+startup, instead of up to 5,400 with the previous full refresh every two seconds.
+`idle_poll_seconds` (30–3600) and `light_poll_seconds` (60–3600) can be set in the
+persistent configuration file. Commands read their own state immediately; active
+movement retains its required keepalive and Stop behavior. Observed external
+movement is followed with plain two-second status reads until it stops.
 
-Version 0.1.3 also reinitializes the radio after an unanswered channel search and
-tries once more. Repeated failed recoveries back off up to five minutes. Every
-channel change is verified against the adapter; radio calls and background polls
-have deadlines. A watchdog exits gracefully if background workers stop
-progressing so Docker can restart the bridge, and a Docker health check exposes
-process health separately from bed availability. Manual Reconnect now genuinely
-reopens the radio. Recovery never replays saved motor or light operations.
+Home Assistant, web app and health checks read cached HTTP status and never
+trigger radio transmissions. `bed.radio.traffic` exposes actual request attempts,
+radio-accepted transmissions, replies, timeouts and counts by function/qualifier.
+A slow idle cache is valid between polls, but a failed primary status read marks
+the base unavailable immediately. Optional light failures do not mark the base
+offline or trigger a channel search.
+
+The RF channel is not assumed to stay fixed. After three consecutive failed
+status checks, a single addressed search across channels 11–26 can locate and
+persist its new channel. Two replies verify a match. Recovery shares the physical
+operation lock and never replays movement/light commands. There is no duplicate
+post-reset scan. Unsuccessful normal reads back off to ten minutes, full channel
+searches back off from ten to thirty minutes, and automatic radio reinitialization
+is limited to once per uninterrupted outage. A successful status read resets the
+outage backoff. These limits reduce traffic to a base that is not answering.
+
+Every channel change is verified against the adapter; radio calls and background
+polls have deadlines. A watchdog exits gracefully if background workers stop
+progressing so Docker can restart the bridge. Its health check exposes process
+health separately from bed availability. Manual Reconnect genuinely reopens the
+radio. Recovery never replays saved motor or light operations.
 
 These mechanisms recover channel changes and software/radio-session failures.
 They cannot remotely power-cycle a foundation controller that has stopped

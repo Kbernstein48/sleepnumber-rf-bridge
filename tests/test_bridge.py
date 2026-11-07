@@ -31,6 +31,22 @@ def status(head, moving=False, motor=0):
     return bytes(data)
 
 
+class Clock:
+    def __init__(self):
+        self.now = 1000.0
+
+    def __call__(self):
+        return self.now
+
+    def advance(self, seconds):
+        self.now += seconds
+
+
+async def due_poll(controller):
+    controller.next_poll = 0
+    await controller.poll_once()
+
+
 class ProtocolTests(unittest.TestCase):
     def test_crc_reference_vector(self):
         self.assertEqual(crc154(b"123456789"), 0x2189)
@@ -68,7 +84,8 @@ class ProtocolTests(unittest.TestCase):
             self.assertEqual(load(path), saved)
             self.assertEqual(saved["presets"]["flat"], 0)
         for bad in ({"target": "ffff"}, {"channel": 10}, {"enabled": "true"},
-                    {"light_outlets": [3, 3]}, {"presets": {"bad name": 40}}, {"password": "unused"}):
+                    {"light_outlets": [3, 3]}, {"presets": {"bad name": 40}}, {"password": "unused"},
+                    {"idle_poll_seconds": 2}, {"idle_poll_seconds": True}, {"light_poll_seconds": 0}):
             with self.assertRaises(ValueError):
                 config(**bad)
 
@@ -150,7 +167,7 @@ class ControllerTests(unittest.IsolatedAsyncioTestCase):
         controller = Controller(config(), FakeTransport)
         await controller.refresh()
         self.assertTrue(controller.snapshot()["connected"])
-        controller.updated = time.monotonic() - 16
+        controller.updated = time.monotonic() - 151
         self.assertFalse(controller.snapshot()["connected"])
 
     async def test_stop_cancels_queued_motion_before_running(self):
@@ -182,10 +199,10 @@ class ChannelRecoveryTests(unittest.IsolatedAsyncioTestCase):
             path = Path(directory) / "config.json"
             controller = Controller(config(), self.ChangedChannel)
             service = Service(controller.config, path, controller)
-            await controller.poll_once()
-            await controller.poll_once()
+            await due_poll(controller)
+            await due_poll(controller)
             self.assertFalse(controller.transport.channels)
-            await controller.poll_once()
+            await due_poll(controller)
             self.assertEqual(controller.config["channel"], 20)
             self.assertEqual(load(path)["channel"], 20)
             self.assertTrue(service.status()["bed"]["connected"])
@@ -197,13 +214,13 @@ class ChannelRecoveryTests(unittest.IsolatedAsyncioTestCase):
     async def test_offline_scan_restores_channel_and_backs_off(self):
         controller = Controller(config(), self.Offline)
         for _ in range(3):
-            await controller.poll_once()
+            await due_poll(controller)
         self.assertEqual(controller.config["channel"], 15)
         self.assertEqual(controller.transport.channel, 15)
         self.assertEqual(set(controller.transport.channels), set(range(11, 27)))
         count = len(controller.transport.channels)
         for _ in range(4):
-            await controller.poll_once()
+            await due_poll(controller)
         self.assertEqual(len(controller.transport.channels), count)
         self.assertFalse(controller.snapshot()["connected"])
 
@@ -211,7 +228,7 @@ class ChannelRecoveryTests(unittest.IsolatedAsyncioTestCase):
         controller = Controller(config(), self.ChangedChannel)
         controller.poll_failures = 3
         async with controller.operation_lock:
-            task = asyncio.create_task(controller.poll_once())
+            task = asyncio.create_task(due_poll(controller))
             await asyncio.sleep(0.02)
             self.assertFalse(task.done())
             self.assertFalse(controller.transport.calls)
@@ -226,7 +243,7 @@ class ChannelRecoveryTests(unittest.IsolatedAsyncioTestCase):
                 return await super().request(command, qualifier, payload, **kwargs)
         controller = Controller(config(), LightTimeout)
         for _ in range(4):
-            await controller.poll_once()
+            await due_poll(controller)
         self.assertFalse(controller.transport.channels)
         self.assertTrue(controller.snapshot()["connected"])
 
@@ -244,9 +261,14 @@ class ChannelRecoveryTests(unittest.IsolatedAsyncioTestCase):
                     raise ReadTimeout("Radio session deaf")
                 return await super().request(command, qualifier, payload, **kwargs)
 
-        controller = Controller(config(), DeafUntilReopened)
+        clock = Clock()
+        controller = Controller(config(), DeafUntilReopened, clock=clock)
         for _ in range(3):
-            await controller.poll_once()
+            await due_poll(controller)
+        self.assertFalse(controller.snapshot()["connected"])
+        self.assertEqual(len(controller.transport.channels), 17)
+        clock.advance(601)
+        await due_poll(controller)
         self.assertTrue(controller.snapshot()["connected"])
         self.assertEqual(controller.config["channel"], 20)
         self.assertEqual(controller.radio_restarts, 1)
@@ -264,17 +286,17 @@ class ChannelRecoveryTests(unittest.IsolatedAsyncioTestCase):
 
         controller = Controller(config(), PowerLoss)
         for _ in range(3):
-            await controller.poll_once()
+            await due_poll(controller)
         self.assertEqual(controller.radio_restarts, 1)
         self.assertEqual(controller.recovery_failures, 1)
         first = len(controller.transport.channels)
         for _ in range(4):
-            await controller.poll_once()
+            await due_poll(controller)
         self.assertEqual(len(controller.transport.channels), first)
         self.assertEqual(controller.radio_restarts, 1)
         self.assertFalse(controller.snapshot()["connected"])
         controller.transport.online = True
-        await controller.poll_once()
+        await due_poll(controller)
         self.assertTrue(controller.snapshot()["connected"])
         self.assertEqual(controller.recovery_failures, 0)
 
@@ -320,6 +342,95 @@ class ChannelRecoveryTests(unittest.IsolatedAsyncioTestCase):
                 await controller.close()
 
 
+class PollingBudgetTests(unittest.IsolatedAsyncioTestCase):
+    async def test_idle_hour_has_only_73_read_requests(self):
+        clock = Clock()
+        controller = Controller(config(), FakeTransport, clock=clock)
+        for _ in range(3600):
+            await controller.poll_once()
+            clock.advance(1)
+        calls = controller.transport.calls
+        self.assertEqual(sum(c[0] == 0x12 for c in calls), 60)
+        self.assertEqual(sum(c[0] == 0x25 for c in calls), 1)
+        self.assertEqual(sum(c[0] == 0x14 for c in calls), 12)
+        self.assertEqual(len(calls), 73)
+        self.assertTrue(all(c[1] == 0 for c in calls if c[0] == 0x12))
+
+    async def test_cached_position_is_valid_between_slow_polls(self):
+        clock = Clock()
+        controller = Controller(config(), FakeTransport, clock=clock)
+        await controller.poll_once()
+        clock.advance(59)
+        self.assertTrue(controller.snapshot()["connected"])
+        before = list(controller.transport.calls)
+        await controller.poll_once()
+        self.assertEqual(controller.transport.calls, before)
+        clock.advance(92)
+        self.assertFalse(controller.snapshot()["connected"])
+
+    async def test_primary_timeout_backs_off_all_requests_and_marks_unavailable(self):
+        clock = Clock()
+        controller = Controller(config(), FakeTransport, clock=clock)
+        await controller.poll_once()
+        controller.transport.plain = [ReadTimeout("lost")]
+        clock.advance(60)
+        await controller.poll_once()
+        count = len(controller.transport.calls)
+        self.assertFalse(controller.snapshot()["connected"])
+        for _ in range(59):
+            clock.advance(1)
+            await controller.poll_once()
+        self.assertEqual(len(controller.transport.calls), count)
+        clock.advance(1)
+        await controller.poll_once()
+        self.assertTrue(controller.snapshot()["connected"])
+
+    async def test_offline_hour_is_bounded_without_duplicate_scans_or_resets(self):
+        clock = Clock()
+        controller = Controller(config(), ChannelRecoveryTests.Offline, clock=clock)
+        for _ in range(3600):
+            await controller.poll_once()
+            clock.advance(1)
+        self.assertLess(len(controller.transport.calls), 90)
+        self.assertEqual(controller.radio_restarts, 1)
+        self.assertEqual(controller.recovery_failures, 3)
+        self.assertTrue(all(c[:2] == (0x12, 0) for c in controller.transport.calls))
+
+    async def test_optional_light_failure_does_not_retry_each_position_poll(self):
+        class MissingLight(FakeTransport):
+            async def request(self, command, qualifier=0, payload=b"", **kwargs):
+                if command == 0x14:
+                    self.calls.append((command, qualifier, payload))
+                    raise ReadTimeout("No outlet reply")
+                return await super().request(command, qualifier, payload, **kwargs)
+
+        clock = Clock()
+        controller = Controller(config(), MissingLight, clock=clock)
+        for _ in range(300):
+            await controller.poll_once()
+            clock.advance(1)
+        self.assertEqual(sum(c[0] == 0x14 for c in controller.transport.calls), 1)
+        self.assertEqual(sum(c[0] == 0x12 for c in controller.transport.calls), 5)
+        self.assertTrue(controller.snapshot()["connected"])
+        self.assertFalse(controller.snapshot()["light"]["available"])
+        self.assertFalse(controller.transport.channels)
+
+    async def test_explicit_refresh_bypasses_idle_deadline(self):
+        controller = Controller(config(), FakeTransport)
+        await controller.poll_once()
+        count = len(controller.transport.calls)
+        await controller.execute("refresh", {})
+        self.assertEqual(len(controller.transport.calls) - count, 3)
+
+    async def test_light_commands_get_immediate_readback_without_configuration_query(self):
+        controller = Controller(config(), FakeTransport)
+        await controller.poll_once()
+        controller.transport.calls.clear()
+        await controller.execute("light", {"enabled": False})
+        self.assertEqual([c[0] for c in controller.transport.calls], [0x13, 0x14])
+        self.assertTrue(controller.snapshot()["light"]["available"])
+
+
 class RadioTests(unittest.IsolatedAsyncioTestCase):
     async def test_channel_change_is_verified(self):
         class Radio:
@@ -347,6 +458,11 @@ class RadioTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ReadTimeout):
             await transport.request(0x11, payload=head_payload(40), timeout=0.02)
         self.assertEqual(transport.radio.count, 1)
+        traffic = transport.statistics()
+        self.assertEqual(traffic["request_attempts"], 1)
+        self.assertEqual(traffic["by_function"], {"0x11/0": 1})
+        self.assertEqual(traffic["timeouts"], {"0x11/0": 1})
+        self.assertEqual(transport.statistics()["request_attempts"], 1)
 
 
 class APITests(unittest.IsolatedAsyncioTestCase):
@@ -388,9 +504,17 @@ class APITests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await response.json())["presets"], {"favorite": 37, "flat": 0})
         self.assertFalse(any(c[0] == 0x11 for c in self.controller.transport.calls))
 
+    async def test_200_cached_http_reads_generate_no_radio_requests(self):
+        await asyncio.sleep(0.01)
+        before = list(self.controller.transport.calls)
+        for _ in range(100):
+            self.assertEqual((await self.client.get("/api/v1/status")).status, 200)
+            self.assertEqual((await self.client.get("/api/v1/health")).status, 200)
+        self.assertEqual(self.controller.transport.calls, before)
+
     async def test_health_distinguishes_offline_base_from_stuck_worker(self):
         await asyncio.sleep(0.01)
-        self.controller.updated = time.monotonic() - 60
+        self.controller.updated = time.monotonic() - 151
         response = await self.client.get("/api/v1/health")
         self.assertEqual(response.status, 200)
         self.assertEqual(await response.json(), {"healthy": True, "bed_connected": False})

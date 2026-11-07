@@ -4,6 +4,8 @@
   "device": "/dev/ttyUSB1",
   "channel": 15,
   "enabled": true,
+  "idle_poll_seconds": 60,
+  "light_poll_seconds": 300,
   "light_outlets": [3],
   "presets": {"flat": 0},
   "lock_file": "/tmp/nightstand-husbzb-capture.lock"

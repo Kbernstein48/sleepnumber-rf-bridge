@@ -1,7 +1,7 @@
 """Exclusive EZSP manufacturing-radio transport; never joins a Zigbee network."""
 
 import asyncio
-from collections import deque
+from collections import Counter, deque
 import contextlib
 import time
 
@@ -29,6 +29,21 @@ class Transport:
         self.request_lock = asyncio.Lock()
         self.rssi = None
         self.recent = deque(maxlen=20)
+        self.request_counts = Counter()
+        self.timeout_counts = Counter()
+        self.transmit_count = 0
+        self.reply_count = 0
+        self.last_transmit = None
+        self.statistics_started = time.monotonic()
+
+    def statistics(self):
+        """Counters of radio attempts, separate from cached HTTP status reads."""
+        return {"request_attempts": sum(self.request_counts.values()),
+                "transmitted": self.transmit_count, "replies": self.reply_count,
+                "by_function": dict(self.request_counts), "timeouts": dict(self.timeout_counts),
+                "uptime_seconds": round(time.monotonic() - self.statistics_started, 1),
+                "last_transmit_age_ms": int((time.monotonic() - self.last_transmit) * 1000)
+                if self.last_transmit is not None else None}
 
     def received(self, name, values):
         if name != "mfglibRxHandler":
@@ -122,10 +137,14 @@ class Transport:
             while not self.queue.empty():
                 self.queue.get_nowait()
             sent = time.monotonic()
+            key = f"0x{command:02x}/{qualifier}"
+            self.request_counts[key] += 1
+            self.last_transmit = sent
             try:
                 (status,) = await asyncio.wait_for(self.radio.mfglibSendPacket(
                     packetContents=encode(self.target, command, qualifier, payload)), timeout)
                 self.check(status, "Transmit")
+                self.transmit_count += 1
                 deadline = time.monotonic() + timeout
                 while True:
                     stamp, frame = await asyncio.wait_for(self.queue.get(), max(0.001, deadline - time.monotonic()))
@@ -133,7 +152,9 @@ class Transport:
                         continue
                     if frame.qualifier in (14, 15):
                         raise RadioError(f"Base rejected function 0x{command:02x}")
+                    self.reply_count += 1
                     return frame.payload
             except TimeoutError as exc:
+                self.timeout_counts[key] += 1
                 # There is no transaction identifier: never repeat an uncertain write.
                 raise ReadTimeout(f"No reply to 0x{command:02x}; command was not repeated") from exc

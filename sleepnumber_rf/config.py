@@ -10,6 +10,7 @@ DEFAULTS = {
     "name": "Sleep Number base", "device": "/dev/ttyUSB1", "channel": 15,
     "enabled": True, "light_outlets": [3], "presets": {"flat": 0},
     "lock_file": "/tmp/nightstand-husbzb-capture.lock",
+    "idle_poll_seconds": 60, "light_poll_seconds": 300,
 }
 
 
@@ -33,6 +34,9 @@ def validate(data):
         raise ValueError("channel must be an integer from 11 to 26")
     if type(result["enabled"]) is not bool:
         raise ValueError("enabled must be true or false")
+    for key, minimum in (("idle_poll_seconds", 30), ("light_poll_seconds", 60)):
+        if type(result[key]) is not int or not minimum <= result[key] <= 3600:
+            raise ValueError(f"{key} must be an integer from {minimum} to 3600")
     outlets = result["light_outlets"]
     if not isinstance(outlets, list) or not outlets or any(type(x) is not int or x not in (3, 4) for x in outlets) or len(set(outlets)) != len(outlets):
         raise ValueError("light_outlets must contain 3 and/or 4")

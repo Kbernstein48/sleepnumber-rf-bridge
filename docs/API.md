@@ -22,15 +22,36 @@ Successful submissions return HTTP 202 with `{"job_id":123,"state":"queued"}`. P
 
 HTTP 400 rejects malformed JSON, unsupported actions/axes or invalid values. HTTP 409 reports conflicting motion, a full queue or settings changes during an operation. Stop is accepted ahead of normal jobs and signals the current movement before the queue worker waits for its lock. It cancels pending position/preset jobs. A position request is rejected while another position/Stop is pending or running.
 
-`positions.right_head` reports measured 0–100%. `connected` requires a live serial session and status less than 15 seconds old. Cached position can remain present when disconnected; use `connected`/`age_ms` to assess availability. `moving`, `homing`, `fault`, `busy`, and `error` describe the current controller state. `radio.rssi` is in dBm. Light `on` is read back from configured outlets; unknown state is `null`.
+`positions.right_head` reports measured 0–100%. `connected` requires a live serial
+session, no failed primary status read, and a non-expired cache (2.5 times the idle
+poll interval, minimum 15 seconds; 15 seconds while moving). `age_ms` reports the
+actual age; cached positions can remain present while disconnected. `moving`,
+`homing`, `fault`, `busy`, and `error` describe the controller state. `radio.rssi`
+is in dBm. Light `on` is confirmed from the configured outlets; a failed light
+read reports unavailable/`null` without taking the position control offline.
 
-`discovering` indicates automatic RF-channel recovery. During a search, `busy` is true. After repeated status timeouts, the controller probes channels 11–26 with plain addressed status reads, verifies two replies and saves the working channel. No prior physical job is replayed. The search is serialized with physical operations, so it never retunes during an active movement job. A failed search restores the configured channel and waits at least 60 seconds before another search.
+Since 0.1.4, default background polling is position every 60 seconds, hardware
+configuration once, and light every 300 seconds. Explicit commands refresh their
+own state without waiting for the background interval. Active movement retains
+its required keepalive. `polling.idle_seconds`, `light_seconds`, and
+`next_check_seconds` describe the scheduler. GET status/health and job reads use
+cached memory and do not send RF packets.
 
-Since 0.1.3, an unanswered full search also closes/reopens the radio and makes one
-more bounded search. Repeated unsuccessful recovery attempts back off up to five
-minutes; ordinary reads continue so a returning base can reconnect sooner.
-`radio.restarts`, `radio.recoveries`, and `radio.failed_searches` expose process-local
-counters. Channel changes are read back from the adapter before probing.
+`radio.traffic` contains process-lifetime `request_attempts`, `transmitted`,
+`replies`, `by_function`, `timeouts`, `uptime_seconds`, and `last_transmit_age_ms`.
+Function keys include the qualifier: `0x12/0` is a plain status query; `0x12/2` is
+an active-motion keepalive. Attempts include uncertain sends; `transmitted` counts
+requests the USB radio accepted. A successful transmit does not prove delivery.
+
+`discovering` indicates RF-channel recovery; `busy` is true during a search.
+After three consecutive primary-status failures, one bounded addressed search
+checks channels 11–26 and verifies two replies before saving a new channel. All
+scans share the physical-operation lock. Unanswered normal queries back off to
+ten minutes; full channel searches back off from ten to thirty minutes. The
+radio is reinitialized at most once per uninterrupted outage, with no immediate
+duplicate scan. `radio.restarts`, `recoveries`, and `failed_searches` expose
+process-local counters. Valid status resets the outage backoff. Manual Reconnect
+remains available, and no prior physical job is replayed after recovery.
 
 Radio calls and poll cycles have deadlines. A process watchdog requests a graceful
 exit if background workers stop progressing; Docker's `unless-stopped` policy

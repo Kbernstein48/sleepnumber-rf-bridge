@@ -17,7 +17,8 @@ class MotionCancelled(RadioError):
 
 
 class Controller:
-    def __init__(self, config, transport_factory=Transport):
+    def __init__(self, config, transport_factory=Transport, *, clock=None):
+        self.clock = clock or time.monotonic
         self.config = config
         self.transport = transport_factory(config)
         self.state = None
@@ -37,26 +38,58 @@ class Controller:
         self.recovery_failures = 0
         self.radio_restarts = 0
         self.recoveries = 0
-        self.last_poll = time.monotonic()
+        self.last_poll = self.clock()
+        self.next_poll = 0.0
+        self.next_features = 0.0
+        self.next_light = 0.0
+        self.lights_valid = False
+        self.reset_for_outage = False
+
+    def retry_delay(self):
+        return min(600, self.config["idle_poll_seconds"] * 2 ** min(max(0, self.poll_failures - 1), 4))
 
     async def read_state(self, keep=False):
-        data = await self.transport.request(0x12, 2 if keep else 0)
+        try:
+            data = await self.transport.request(0x12, 2 if keep else 0)
+        except ReadTimeout:
+            self.poll_failures += 1
+            self.next_poll = self.clock() + self.retry_delay()
+            raise
         self.state = foundation_status(data)
-        self.updated = time.monotonic()
+        self.updated = self.clock()
+        self.poll_failures = 0
+        self.recovery_failures = 0
+        self.reset_for_outage = False
+        self.next_poll = self.updated + (2 if self.state["moving"] else self.config["idle_poll_seconds"])
         return self.state
 
     async def refresh(self, full=True):
         await self.read_state()
-        if full:
+        now = self.clock()
+        if full or not self.features and now >= self.next_features:
+            self.next_features = now + 600
             self.features = system_status(await self.transport.request(0x25))
-            if self.features["has_light"]:
+        if self.features.get("has_light") and (full or now >= self.next_light):
+            # Schedule before the read: an outlet timeout must not cause a retry
+            # on every otherwise successful position poll.
+            self.next_light = now + self.config["light_poll_seconds"]
+            self.lights_valid = False
+            try:
                 for outlet in self.config["light_outlets"]:
                     self.lights[outlet] = outlet_status(await self.transport.request(0x14, outlet))
+            except BaseException:
+                self.lights_valid = False
+                raise
+            self.lights_valid = True
         self.error = ""
 
     def snapshot(self):
-        age = int((time.monotonic() - self.updated) * 1000) if self.updated else None
-        connected = bool(self.config["enabled"] and self.transport.ready and age is not None and age < 15000)
+        age = int((self.clock() - self.updated) * 1000) if self.updated else None
+        stale_after = max(15000, self.config["idle_poll_seconds"] * 2500)
+        if self.state and self.state["moving"]:
+            stale_after = 15000
+        connected = bool(self.config["enabled"] and self.transport.ready and age is not None
+                         and age < stale_after and not self.poll_failures)
         state = self.state or {}
         return {"connected": connected, "transport": "rf", "foundation": bool(self.state),
                 "model": "360 FlexFit", "head_only": True, "busy": self.busy or self.discovering,
@@ -65,11 +98,15 @@ class Controller:
                 "fault": state.get("fault", False), "age_ms": age, "error": self.error,
                 "positions": {"right_head": state["head"]} if self.state else {},
                 "presets": list(self.config["presets"]),
-                "light": {"available": self.features.get("has_light", False),
-                          "on": any(item["on"] for item in self.lights.values()) if self.lights else None},
+                "light": {"available": self.features.get("has_light", False) and self.lights_valid,
+                          "on": any(item["on"] for item in self.lights.values()) if self.lights_valid else None},
                 "radio": {"channel": self.config["channel"], "rssi": self.transport.rssi,
                           "restarts": self.radio_restarts, "recoveries": self.recoveries,
-                          "failed_searches": self.recovery_failures},
+                          "failed_searches": self.recovery_failures,
+                          "traffic": getattr(self.transport, "statistics", lambda: {})()},
+                "polling": {"idle_seconds": self.config["idle_poll_seconds"],
+                            "light_seconds": self.config["light_poll_seconds"],
+                            "next_check_seconds": round(max(0, self.next_poll - self.clock()), 1)},
                 "stop_method": "withdraw_keepalive"}
 
     async def discover_channel(self):
@@ -82,7 +119,7 @@ class Controller:
         found = False
         self.discovering = True
         self.error = "Searching RF channels for the base"
-        self.last_discovery = time.monotonic()
+        self.last_discovery = self.clock()
         try:
             channels = [original] + [channel for channel in range(11, 27) if channel != original]
             for channel in channels:
@@ -97,10 +134,12 @@ class Controller:
                 except (ReadTimeout, ValueError):
                     continue
                 self.state = state
-                self.updated = time.monotonic()
+                self.updated = self.clock()
                 self.config["channel"] = channel
                 found = True
                 self.poll_failures = 0
+                self.next_poll = self.clock() + self.config["idle_poll_seconds"]
+                self.reset_for_outage = False
                 if channel != original and self.config_changed:
                     self.config_changed()
                 self.error = ""
@@ -110,12 +149,12 @@ class Controller:
             return False
         finally:
             self.discovering = False
-            self.last_discovery = time.monotonic()
+            self.last_discovery = self.clock()
             if not found:
                 await self.transport.set_channel(original)
 
     async def recover_connection(self):
-        """Recover reads only, including a fresh radio session if scanning fails.
+        """One bounded search, with at most one radio reset per outage.
 
         Called with operation_lock held. Never replay an actuator/light write.
         A base that has lost power must not cause an unbounded reset loop.
@@ -124,19 +163,16 @@ class Controller:
             self.recovery_failures = 0
             self.recoveries += 1
             return True
-        if self.closing or not self.config["enabled"]:
-            return False
-        self.error = "Reinitializing radio after unanswered channel search"
-        LOG.warning(self.error)
-        self.radio_restarts += 1
-        await self.transport.close()
-        await self.transport.open()
-        if await self.discover_channel():
-            self.recovery_failures = 0
-            self.recoveries += 1
-            return True
         self.recovery_failures += 1
-        self.error = "Base not responding after channel search and radio restart; check base power"
+        if not self.closing and self.config["enabled"] and not self.reset_for_outage:
+            self.error = "Reinitializing radio once for this outage; no duplicate channel search"
+            LOG.warning(self.error)
+            self.reset_for_outage = True
+            self.radio_restarts += 1
+            await self.transport.close()
+            await self.transport.open()
+        self.next_poll = self.clock() + self.retry_delay()
+        self.error = "Base not responding; backing off radio requests"
         LOG.warning(self.error)
         return False
 
@@ -144,22 +180,22 @@ class Controller:
         # Connection changes, ordinary reads, recovery scans and physical jobs
         # all share this lock. A scan therefore cannot interrupt MicroAdjust.
         async with self.operation_lock:
+            if self.config["enabled"] and self.clock() < self.next_poll:
+                return
             try:
                 if self.config["enabled"]:
                     if not self.transport.ready:
                         await self.transport.open()
                     try:
-                        await self.refresh()
-                        self.poll_failures = 0
-                        self.recovery_failures = 0
+                        await self.refresh(full=False)
                     except ReadTimeout as exc:
                         self.error = str(exc)
-                        self.poll_failures += 1
-                        now = time.monotonic()
-                        stale = not self.updated or now - self.updated >= 8
-                        delay = min(300, 60 * 2 ** min(self.recovery_failures, 3))
+                        now = self.clock()
+                        # Only primary-status failures count. Missing optional
+                        # light/configuration telemetry cannot start a hunt.
+                        delay = min(1800, 600 * 2 ** min(max(0, self.recovery_failures - 1), 2))
                         can_scan = self.last_discovery is None or now - self.last_discovery >= delay
-                        if self.poll_failures >= 3 and stale and can_scan:
+                        if self.poll_failures >= 3 and can_scan:
                             await self.recover_connection()
                         else:
                             LOG.warning("Radio poll: %s", exc)
@@ -169,6 +205,8 @@ class Controller:
                 raise
             except Exception as exc:
                 self.error = str(exc)
+                self.poll_failures += 1
+                self.next_poll = self.clock() + self.retry_delay()
                 LOG.warning("Radio poll: %s", exc)
                 await self.transport.close()
 
@@ -185,7 +223,7 @@ class Controller:
                 with contextlib.suppress(Exception):
                     await self.transport.close()
             finally:
-                self.last_poll = time.monotonic()
+                self.last_poll = self.clock()
             await asyncio.sleep(2)
 
     def start(self):
@@ -286,12 +324,15 @@ class Controller:
             await self.refresh()
         if not self.features.get("has_light"):
             raise RadioError("No underbed light reported")
+        self.lights_valid = False
         for outlet in self.config["light_outlets"]:
             await self.transport.request(0x13, outlet, bytes([enabled, 120 if enabled else 0, 0]))
             result = outlet_status(await self.transport.request(0x14, outlet))
             if result["on"] != enabled:
                 raise RadioError("Light state was not confirmed")
             self.lights[outlet] = result
+        self.lights_valid = True
+        self.next_light = self.clock() + self.config["light_poll_seconds"]
 
     async def execute(self, action, data):
         async with self.operation_lock:
