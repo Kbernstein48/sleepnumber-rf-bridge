@@ -50,6 +50,14 @@ persistent configuration file. Commands read their own state immediately; active
 movement retains its required keepalive and Stop behavior. Observed external
 movement is followed with plain two-second status reads until it stops.
 
+Version 0.1.5 also follows each successful position/preset adjustment with plain
+position reads every two seconds for 30 seconds after the adjustment completes.
+Another successful adjustment starts a fresh 30-second window. The window then
+expires back to the idle interval; a missed primary reply cancels it and follows
+the normal retry backoff. It does not repeatedly query capabilities or light
+state, and does not send motion keepalive after movement ends. Startup, ordinary
+HTTP reads and light commands do not start a follow-up window.
+
 Home Assistant, web app and health checks read cached HTTP status and never
 trigger radio transmissions. `bed.radio.traffic` exposes actual request attempts,
 radio-accepted transmissions, replies, timeouts and counts by function/qualifier.

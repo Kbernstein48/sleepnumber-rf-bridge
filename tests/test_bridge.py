@@ -343,6 +343,76 @@ class ChannelRecoveryTests(unittest.IsolatedAsyncioTestCase):
 
 
 class PollingBudgetTests(unittest.IsolatedAsyncioTestCase):
+    async def test_position_and_preset_get_15_plain_followup_reads_then_idle(self):
+        for action, data in (("position", {"value": 40}), ("preset", {"preset": "favorite"})):
+            with self.subTest(action=action):
+                clock = Clock()
+                controller = Controller(config(presets={"favorite": 40}), FakeTransport, clock=clock)
+                await controller.refresh()
+                await controller.execute(action, data)
+                controller.transport.calls.clear()
+                for _ in range(30):
+                    clock.advance(1)
+                    await controller.poll_once()
+                self.assertEqual(controller.transport.calls, [(0x12, 0, b"")] * 15)
+                self.assertEqual(controller.snapshot()["polling"]["position_followup_remaining_seconds"], 0)
+                clock.advance(59)
+                await controller.poll_once()
+                self.assertEqual(len(controller.transport.calls), 15)
+                clock.advance(1)
+                await controller.poll_once()
+                self.assertEqual(len(controller.transport.calls), 16)
+
+    async def test_another_adjustment_restarts_30_second_window(self):
+        clock = Clock()
+        controller = Controller(config(), FakeTransport, clock=clock)
+        await controller.refresh()
+        await controller.execute("position", {"value": 40})
+        clock.advance(20)
+        await controller.execute("position", {"value": 40})
+        clock.advance(11)
+        await controller.poll_once()
+        self.assertEqual(controller.snapshot()["polling"]["position_followup_remaining_seconds"], 19)
+        self.assertEqual(controller.next_poll - clock(), 2)
+
+    async def test_followup_timeout_cancels_burst_and_preserves_backoff(self):
+        clock = Clock()
+        controller = Controller(config(), FakeTransport, clock=clock)
+        await controller.refresh()
+        await controller.execute("position", {"value": 40})
+        controller.transport.calls.clear()
+        controller.transport.plain = [ReadTimeout("No bed reply")]
+        clock.advance(2)
+        await controller.poll_once()
+        self.assertEqual(controller.snapshot()["polling"]["position_followup_remaining_seconds"], 0)
+        for _ in range(59):
+            clock.advance(1)
+            await controller.poll_once()
+        self.assertEqual(len(controller.transport.calls), 1)
+        clock.advance(1)
+        await controller.poll_once()
+        self.assertEqual(len(controller.transport.calls), 2)
+        self.assertEqual(controller.next_poll - clock(), 60)
+
+    async def test_failed_position_never_starts_followup(self):
+        clock = Clock()
+        controller = Controller(config(), FakeTransport, clock=clock)
+        controller.transport.plain = [ReadTimeout("No bed")]
+        with self.assertRaises(ReadTimeout):
+            await controller.execute("position", {"value": 40})
+        self.assertEqual(controller.snapshot()["polling"]["position_followup_remaining_seconds"], 0)
+        clock.advance(2)
+        await controller.poll_once()
+        self.assertEqual(controller.transport.calls, [(0x12, 0, b"")])
+
+    async def test_startup_refresh_and_light_do_not_start_fast_followup(self):
+        controller = Controller(config(), FakeTransport)
+        await controller.poll_once()
+        await controller.execute("refresh", {})
+        await controller.execute("light", {"enabled": False})
+        self.assertEqual(controller.snapshot()["polling"]["position_followup_remaining_seconds"], 0)
+        self.assertGreater(controller.next_poll - controller.clock(), 59)
+
     async def test_idle_hour_has_only_73_read_requests(self):
         clock = Clock()
         controller = Controller(config(), FakeTransport, clock=clock)

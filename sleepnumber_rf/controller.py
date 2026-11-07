@@ -10,6 +10,8 @@ from .transport import Transport, RadioError, ReadTimeout
 
 LOG = logging.getLogger(__name__)
 POLL_TIMEOUT = 120
+FAST_POLL_SECONDS = 2
+POSITION_FOLLOWUP_SECONDS = 30
 
 
 class MotionCancelled(RadioError):
@@ -44,6 +46,17 @@ class Controller:
         self.next_light = 0.0
         self.lights_valid = False
         self.reset_for_outage = False
+        self.position_followup_until = 0.0
+
+    def poll_interval(self):
+        if (self.state and self.state["moving"]) or self.clock() < self.position_followup_until:
+            return FAST_POLL_SECONDS
+        return self.config["idle_poll_seconds"]
+
+    def follow_position(self):
+        """Track a confirmed adjustment briefly without changing idle polling."""
+        self.position_followup_until = self.clock() + POSITION_FOLLOWUP_SECONDS
+        self.next_poll = self.clock() + FAST_POLL_SECONDS
 
     def retry_delay(self):
         return min(600, self.config["idle_poll_seconds"] * 2 ** min(max(0, self.poll_failures - 1), 4))
@@ -52,6 +65,7 @@ class Controller:
         try:
             data = await self.transport.request(0x12, 2 if keep else 0)
         except ReadTimeout:
+            self.position_followup_until = 0.0
             self.poll_failures += 1
             self.next_poll = self.clock() + self.retry_delay()
             raise
@@ -60,7 +74,7 @@ class Controller:
         self.poll_failures = 0
         self.recovery_failures = 0
         self.reset_for_outage = False
-        self.next_poll = self.updated + (2 if self.state["moving"] else self.config["idle_poll_seconds"])
+        self.next_poll = self.updated + self.poll_interval()
         return self.state
 
     async def refresh(self, full=True):
@@ -86,7 +100,7 @@ class Controller:
     def snapshot(self):
         age = int((self.clock() - self.updated) * 1000) if self.updated else None
         stale_after = max(15000, self.config["idle_poll_seconds"] * 2500)
-        if self.state and self.state["moving"]:
+        if (self.state and self.state["moving"]) or self.clock() < self.position_followup_until:
             stale_after = 15000
         connected = bool(self.config["enabled"] and self.transport.ready and age is not None
                          and age < stale_after and not self.poll_failures)
@@ -106,6 +120,8 @@ class Controller:
                           "traffic": getattr(self.transport, "statistics", lambda: {})()},
                 "polling": {"idle_seconds": self.config["idle_poll_seconds"],
                             "light_seconds": self.config["light_poll_seconds"],
+                            "fast_seconds": FAST_POLL_SECONDS,
+                            "position_followup_remaining_seconds": round(max(0, self.position_followup_until - self.clock()), 1),
                             "next_check_seconds": round(max(0, self.next_poll - self.clock()), 1)},
                 "stop_method": "withdraw_keepalive"}
 
@@ -138,7 +154,7 @@ class Controller:
                 self.config["channel"] = channel
                 found = True
                 self.poll_failures = 0
-                self.next_poll = self.clock() + self.config["idle_poll_seconds"]
+                self.next_poll = self.clock() + self.poll_interval()
                 self.reset_for_outage = False
                 if channel != original and self.config_changed:
                     self.config_changed()
@@ -205,6 +221,7 @@ class Controller:
                 raise
             except Exception as exc:
                 self.error = str(exc)
+                self.position_followup_until = 0.0
                 self.poll_failures += 1
                 self.next_poll = self.clock() + self.retry_delay()
                 LOG.warning("Radio poll: %s", exc)
@@ -364,6 +381,7 @@ class Controller:
                         raise MotionCancelled("Cancelled by Stop")
                     position = data["value"] if action == "position" else self.config["presets"][data["preset"]]
                     await self.move(position)
+                    self.follow_position()
                 elif action == "light":
                     await self.light(data["enabled"])
                 else:

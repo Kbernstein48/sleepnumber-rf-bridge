@@ -37,6 +37,16 @@ its required keepalive. `polling.idle_seconds`, `light_seconds`, and
 `next_check_seconds` describe the scheduler. GET status/health and job reads use
 cached memory and do not send RF packets.
 
+Since 0.1.5, a successful position or preset job starts a 30-second follow-up
+window of plain position reads every two seconds, after movement completes.
+Another successful adjustment renews the window. A primary read timeout cancels
+the window and applies normal backoff. Startup, light commands and cached HTTP
+reads do not trigger it. `polling.fast_seconds` reports the two-second interval;
+`position_followup_remaining_seconds` reports the remaining window. Afterward,
+polling returns to the configured idle interval. This adds at most 15 background
+position reads per window, without renewing motion keepalive or repeatedly
+refreshing hardware configuration/light telemetry.
+
 `radio.traffic` contains process-lifetime `request_attempts`, `transmitted`,
 `replies`, `by_function`, `timeouts`, `uptime_seconds`, and `last_transmit_age_ms`.
 Function keys include the qualifier: `0x12/0` is a plain status query; `0x12/2` is
